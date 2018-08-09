@@ -1,88 +1,100 @@
 extern crate futures;
-extern crate futures_cpupool;
 extern crate hyper;
-extern crate tokio_core;
+extern crate tokio;
 
-use std::rc::Rc;
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
+use futures::future;
+use hyper::rt::{Future, Stream};
+use hyper::service::Service;
+use hyper::{Body, Method, Request, Response, Server, StatusCode};
 
-use futures::future::Future;
-use futures::future::ok;
-use futures::Stream;
+use tokio::executor::spawn;
 
-use futures_cpupool::CpuPool;
+/// We need to return different futures depending on the route matched,
+/// and we can do that with an enum, such as `futures::Either`, or with
+/// trait objects.
+///
+/// A boxed Future (trait object) is used as it is easier to understand
+/// and extend with more types. Advanced users could switch to `Either`.
+type BoxFut = Box<Future<Item = Response<Body>, Error = hyper::Error> + Send>;
 
-use tokio_core::reactor::Core;
-
-use hyper::{Get, Post, StatusCode};
-use hyper::header::ContentLength;
-use hyper::server::{Http, Service, Request, Response};
-
-static INDEX: &'static [u8] = b"Try POST /hello";
-
-struct Proxy {
-    pool: Rc<CpuPool>
-}
+struct Proxy;
 
 impl Service for Proxy {
-    type Request = Request;
-    type Response = Response;
+    type ReqBody = Body;
+    type ResBody = Body;
     type Error = hyper::Error;
-    type Future = Box<Future<Item=Response, Error=hyper::Error>>;
+    type Future = BoxFut;
 
-    fn call(&self, req: Request) -> Self::Future {
-        let (method, uri, _, _, body) = req.deconstruct();
+    fn call(&mut self, req: Request<Body>) -> BoxFut {
+        let (parts, body) = req.into_parts();
 
-        match (method, uri.path()) {
-            (Get, "/") | (Get, "/echo") => {
-                Box::new(ok(Response::new()
-                    .with_header(ContentLength(INDEX.len() as u64))
-                    .with_body(INDEX)))
-            },
-            (Post, _) => {
-                let f = self.pool.spawn_fn(move || {
-                    let p = Path::new(uri.path());
-                    let mut f = File::create(p.components().last().unwrap().as_os_str()).unwrap();
+        match (parts.method, parts.uri.path()) {
+            (Method::GET, "/") => {
+                let mut response = Response::new(Body::empty());
 
-                    body.for_each(move |chunk| {
-                        f.write(chunk.as_ref());
+                *response.body_mut() = Body::from("Try POSTing data to /echo");
+                Box::new(future::ok(response))
+            }
 
-                        Ok(())
+            (Method::POST, _) => {
+                use std::fs::File;
+                use std::path::Path;
+                use std::io::prelude::*;
+                
+                let uri = parts.uri.clone();
+                
+                let (sender, receiver) = futures::sync::oneshot::channel::<()>();
+
+                spawn(
+                    future::lazy(move || {
+                        let p = Path::new(uri.path());
+                        let mut f = File::create(p.components().last().unwrap().as_os_str()).unwrap();
+
+                        body.for_each(move |chunk| {
+                            f.write(chunk.as_ref());
+
+                            Ok(())
+                        })
                     })
-                }).and_then(|_| {
-                    Box::new(ok(Response::new()
-                        .with_status(StatusCode::Ok)))
-                });
+                    .map_err(|_| panic!("error!"))
+                    .and_then(|_| {
+                        sender.send(())
+                    })
+                );
 
+
+                let f = receiver.and_then(|_| {
+                    let response = Response::new(Body::empty());
+                
+                    future::ok(response)
+                }).map_err(|_| panic!("Error creating response body!"));
+                
                 Box::new(f)
-            },
+            }
+
+            // The 404 Not Found route...
             _ => {
-                Box::new(ok(Response::new()
-                    .with_status(StatusCode::NotFound)))
+                let mut response = Response::new(Body::empty());
+
+                *response.status_mut() = StatusCode::NOT_FOUND;
+                Box::new(future::ok(response))
             }
         }
-    }
 
+    }
 }
 
+fn spawn_service() -> Result<Proxy, hyper::Error> {
+    Ok(Proxy)
+}
 
 fn main() {
-    let addr = "127.0.0.1:1337".parse().unwrap();
+    let addr = ([127, 0, 0, 1], 3000).into();
 
-    let mut core = Core::new().unwrap();
-    let handle = core.handle();
+    let server = Server::bind(&addr)
+        .serve(|| spawn_service() )
+        .map_err(|e| eprintln!("server error: {}", e));
 
-    let pool = Rc::new(CpuPool::new(4));
-
-    let server = Http::new().serve_addr_handle(&addr, &handle, move || Ok(Proxy { pool: pool.clone() })).unwrap();
-
-    let handle1 = handle.clone();
-    handle.spawn(server.for_each(move |conn| {
-        handle1.spawn(conn.map(|_| ()).map_err(|err| println!("srv1 error: {:?}", err)));
-        Ok(())
-    }).map_err(|_| ()));
-
-    core.run(futures::future::empty::<(), ()>()).unwrap();
+    println!("Listening on http://{}", addr);
+    hyper::rt::run(server);
 }

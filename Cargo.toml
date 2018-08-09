@@ -1,10 +1,9 @@
 [package]
-name = "hyper-http-proxy"
+name = "hyper-write-to-file-threaded"
 version = "0.1.0"
 authors = ["Florian Gilcher <florian.gilcher@asquera.de>"]
 
 [dependencies]
-hyper = "*"
-futures = "*"
-futures-cpupool = "*"
-tokio-core = "*"
+hyper = "0.12"
+futures = "0.1"
+tokio = "0.1"
