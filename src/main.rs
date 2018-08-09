@@ -12,8 +12,6 @@ use hyper::rt::{Future, Stream};
 use hyper::service::Service;
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 
-use tokio::executor::spawn;
-
 /// We need to return different futures depending on the route matched,
 /// and we can do that with an enum, such as `futures::Either`, or with
 /// trait objects.
@@ -53,7 +51,7 @@ impl Service for Proxy {
                 
                 let (sender, receiver) = futures::sync::oneshot::channel::<Result<(), Error>>();
 
-                spawn(
+                tokio::spawn(
                     future::lazy(move || {
                         let p = Path::new(uri.path());
                         let mut f = File::create(p.components().last().unwrap().as_os_str()).unwrap();
