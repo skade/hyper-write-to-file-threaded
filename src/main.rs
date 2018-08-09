@@ -2,7 +2,12 @@ extern crate futures;
 extern crate hyper;
 extern crate tokio;
 
+use std::fs::File;
+use std::path::Path;
+use std::io::prelude::*;
+
 use futures::future;
+
 use hyper::rt::{Future, Stream};
 use hyper::service::Service;
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
@@ -18,6 +23,12 @@ use tokio::executor::spawn;
 type BoxFut = Box<Future<Item = Response<Body>, Error = hyper::Error> + Send>;
 
 struct Proxy;
+
+#[derive(Debug)]
+enum Error {
+    FSError(std::io::Error),
+    HyperError(hyper::Error)
+}
 
 impl Service for Proxy {
     type ReqBody = Body;
@@ -37,37 +48,42 @@ impl Service for Proxy {
             }
 
             (Method::POST, _) => {
-                use std::fs::File;
-                use std::path::Path;
-                use std::io::prelude::*;
                 
                 let uri = parts.uri.clone();
                 
-                let (sender, receiver) = futures::sync::oneshot::channel::<()>();
+                let (sender, receiver) = futures::sync::oneshot::channel::<Result<(), Error>>();
 
                 spawn(
                     future::lazy(move || {
                         let p = Path::new(uri.path());
                         let mut f = File::create(p.components().last().unwrap().as_os_str()).unwrap();
 
-                        body.for_each(move |chunk| {
-                            f.write(chunk.as_ref());
-
-                            Ok(())
+                        body.map_err(Error::HyperError)
+                        .for_each(move |chunk| {
+                            f.write(chunk.as_ref())
+                                .map(|_| () )
+                                .map_err(Error::FSError)
                         })
                     })
-                    .map_err(|_| panic!("error!"))
-                    .and_then(|_| {
-                        sender.send(())
+                    .then(|result| {
+                        sender.send(result)
                     })
+                    .map_err(|e| panic!("Unrecoverable error: couldn't send data back to handler: {:?}", e))
                 );
 
 
-                let f = receiver.and_then(|_| {
-                    let response = Response::new(Body::empty());
-                
+                let f = receiver.then(|r| {
+                    let mut response = Response::new(Body::empty());
+
+                    match r {
+                        Ok(_) => {}
+                        Err(e) => {
+                            *response.body_mut() = Body::from(format!("An error occured: {:?}", e));
+                            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        }
+                    }
                     future::ok(response)
-                }).map_err(|_| panic!("Error creating response body!"));
+                });
                 
                 Box::new(f)
             }
